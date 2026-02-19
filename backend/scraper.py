@@ -10,10 +10,24 @@ Usage: python scraper.py
 """
 
 import re
+import os
 import time
 import httpx
 from datetime import datetime, timezone
 from db_client import get_supabase
+
+# Optional: Gemini Vision for bet slip images
+try:
+    import google.generativeai as genai
+    _GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
+    if _GEMINI_KEY:
+        genai.configure(api_key=_GEMINI_KEY)
+        _VISION_MODEL = genai.GenerativeModel("gemini-1.5-flash")
+        print("✨ Gemini Vision enabled — will read bet slip images")
+    else:
+        _VISION_MODEL = None
+except ImportError:
+    _VISION_MODEL = None
 
 HEADERS = {"User-Agent": "PickScout/1.0 (sports picks aggregator)"}
 
@@ -85,6 +99,16 @@ UNITS_PATTERN = re.compile(
 ODDS_PATTERN = re.compile(r"([+-]\d{2,4})")
 
 HYPE_WORDS = ["lock", "guaranteed", "can't miss", "whale", "free money", "99%", "easy money", "can't lose"]
+
+# A post must contain at least ONE of these to be considered a sports pick.
+# This filters out sports articles, news posts, discussion threads, etc.
+BETTING_KEYWORDS = [
+    "bet", "pick", "potd", "tail", "parlay", "moneyline", "ml ", " ml",
+    "spread", "cover", "over/under", "o/u", "over ", "under ",
+    "units", " unit", "+ev", "sharp", "fade", "lock",
+    "fanduel", "draftkings", "prizepicks", "betmgm", "caesars", "stake",
+    "wager", "puck line", "run line", "ats", "prop", "same game",
+]
 
 SPORT_KEYWORDS = {
     "Basketball": ["nba", "basketball", "lakers", "celtics", "bulls", "warriors", "bucks", "nets"],
@@ -173,26 +197,80 @@ def fetch_op_comments(permalink: str, author: str) -> str:
         return ""
 
 
+def analyze_image_post(image_url: str) -> str:
+    """
+    Send a Reddit bet-slip image to Gemini Vision and return structured text
+    describing the pick (team, bet type, odds, stake). Returns "" if Vision
+    is not configured or the image can't be read.
+    """
+    if not _VISION_MODEL or not image_url:
+        return ""
+    try:
+        img_bytes = httpx.get(image_url, timeout=10.0).content
+        import PIL.Image, io
+        img = PIL.Image.open(io.BytesIO(img_bytes))
+        prompt = (
+            "This is a sports bet slip screenshot. "
+            "Extract and return ONLY: the team or player being bet on, "
+            "the bet type (moneyline/spread/over-under/prop), "
+            "the American odds (e.g. -110 or +150), "
+            "and the stake/risk amount if visible. "
+            "Format: TEAM | BET_TYPE | ODDS | STAKE. "
+            "If you cannot read the slip clearly, return UNREADABLE."
+        )
+        response = _VISION_MODEL.generate_content([prompt, img])
+        text = response.text.strip()
+        if "UNREADABLE" in text.upper():
+            return ""
+        return text
+    except Exception as e:
+        return ""
+
 # ---------------------------------------------------------------------------
 # Core parser
 # ---------------------------------------------------------------------------
 
 def parse_post(post_data: dict) -> dict | None:
     """Parse a Reddit post into a structured pick dict. Returns None if not a valid pick."""
-    title   = post_data.get("title", "")
-    body    = post_data.get("selftext", "")
-    author  = post_data.get("author", "")
+    title     = post_data.get("title", "")
+    body      = post_data.get("selftext", "")
+    author    = post_data.get("author", "")
     permalink = post_data.get("permalink", "")
-    url     = f"https://reddit.com{permalink}"
-    full_text = f"{title}\n{body}"
+    url       = f"https://reddit.com{permalink}"
+    post_hint = post_data.get("post_hint", "")
+    image_url = post_data.get("url", "") if post_hint == "image" else ""
 
-    # Must have odds to be considered a pick
+    full_text = f"{title}\n{body}"
+    text_lower = full_text.lower()
+
+    # ── Gate 1: Must contain at least one betting keyword ──────────────────
+    # This is the primary filter that kills sports articles, news, etc.
+    if not any(kw in text_lower for kw in BETTING_KEYWORDS):
+        # Also accept if it's an image post — could be a bet slip
+        if not image_url:
+            return None
+
+    # ── Image posts: try Gemini Vision to read the bet slip ───────────────
+    vision_text = ""
+    if image_url:
+        vision_text = analyze_image_post(image_url)
+        if vision_text:
+            print(f"  👁️  Vision extracted: {vision_text[:80]}")
+            full_text = f"{full_text}\n{vision_text}"
+            text_lower = full_text.lower()
+
+    # ── Gate 2: Must have American odds ───────────────────────────────────
     odds_match = ODDS_PATTERN.search(full_text)
     if not odds_match:
         return None
     try:
         odds = int(odds_match.group(1))
     except ValueError:
+        return None
+
+    # Sanity-check odds range — real American odds are -5000 to +10000
+    # but very extreme values are usually stats/scores, not odds
+    if not (-2500 <= odds <= 5000):
         return None
 
     # Try to find record in title + body first
