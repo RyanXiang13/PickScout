@@ -1,41 +1,107 @@
 """
-scraper.py — Fetches today's POTD posts from Reddit via public JSON feeds.
+scraper.py — Fetches sports pick posts from Reddit via public JSON feeds.
 No API key required — uses Reddit's public .json endpoints.
+
+For each post found, if no record is detected in title/body, we fetch the
+post's comment thread and look for the OP's own comments that may contain
+their record (very common on Reddit).
+
 Usage: python scraper.py
 """
 
 import re
+import time
 import httpx
 from datetime import datetime, timezone
 from db_client import get_supabase
 
 HEADERS = {"User-Agent": "PickScout/1.0 (sports picks aggregator)"}
 
-SUBREDDITS = ["sportsbook", "sportsbetting", "sportspicks"]
+SUBREDDITS = [
+    # General betting
+    "sportsbook",
+    "sportsbetting",
+    # Pick-focused
+    "PickOfTheDay",
+    "SportsPicksHub",
+    # Sport-specific
+    "nba",
+    "nfl",
+    "nhl",
+    "baseball",
+    "soccer",
+    # Prop bets & parlays
+    "PrizePicks",
+    "parlays",
+]
 
-SEARCH_QUERIES = ["POTD", "Pick of the Day", "daily pick"]
+SEARCH_QUERIES = [
+    "POTD",
+    "Pick of the Day",
+    "daily pick",
+    "free pick",
+    "record",
+    "units",
+]
 
-# Regex patterns for extracting data from post titles/bodies
+# ---------------------------------------------------------------------------
+# Regex patterns
+# ---------------------------------------------------------------------------
+
+# Exhaustive record pattern — catches every real-world format seen on Reddit:
+#   (50-25)  [50-25]  50W-25L  50W/25L  50-25  Record: 50-25
+#   went 50-25  going 50-25  50 and 25  50/25  50-25-3 (with push)
+#   "last X picks" style is intentionally excluded (too noisy)
 RECORD_PATTERN = re.compile(
-    r"(?:record|rec)[\s:]*(\d+)\s*[-–]\s*(\d+)", re.IGNORECASE
+    r"""
+    (?:
+        # (50-25) or (50–25)
+        \((\d{1,4})\s*[-–/]\s*(\d{1,4})(?:\s*[-–/]\s*\d{1,3})?\)
+        |
+        # [50-25]
+        \[(\d{1,4})\s*[-–/]\s*(\d{1,4})(?:\s*[-–/]\s*\d{1,3})?\]
+        |
+        # 50W-25L  or  50W/25L
+        (\d{1,4})\s*W\s*[-–/]\s*(\d{1,4})\s*L
+        |
+        # went/going/sitting/currently X-Y
+        (?:went|going|sitting|currently|finished|record\s+is|i(?:'m|\sam)\s+)?
+        (?:record|rec|season|ytd|overall|this\s+(?:week|month|season))\s*:?\s*
+        (\d{1,4})\s*[-–]\s*(\d{1,4})
+        |
+        # bare "50 and 25"  (only match if both numbers present)
+        \b(\d{1,4})\s+and\s+(\d{1,4})\s+(?:on\s+the\s+)?(?:season|week|month|year|picks?)
+        |
+        # "went 50-25" / "going 8-0" — verb signals it's a record
+        (?:went|going|finished|sitting|currently\s+at)\s+(\d{1,4})\s*[-–]\s*(\d{1,4})
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
+
 UNITS_PATTERN = re.compile(
-    r"([+-]?\d+\.?\d*)\s*u(?:nits?)?", re.IGNORECASE
+    r"([+-]?(?:\d+\.)?\d+)\s*u(?:nits?)?", re.IGNORECASE
 )
 ODDS_PATTERN = re.compile(r"([+-]\d{2,4})")
 
+HYPE_WORDS = ["lock", "guaranteed", "can't miss", "whale", "free money", "99%", "easy money", "can't lose"]
+
 SPORT_KEYWORDS = {
-    "Basketball": ["nba", "basketball", "lakers", "celtics", "bulls", "warriors"],
-    "Football": ["nfl", "football", "chiefs", "patriots", "cowboys"],
-    "Hockey": ["nhl", "hockey", "leafs", "bruins", "rangers", "puck"],
-    "Baseball": ["mlb", "baseball", "yankees", "dodgers", "mets"],
-    "Soccer": ["mls", "soccer", "premier", "la liga", "champions league"],
-    "Esports": ["esports", "cs2", "lol", "valorant", "dota", "overwatch"],
-    "Olympics": ["olympics", "olympic", "curling", "biathlon", "skating"],
-    "Tennis": ["tennis", "atp", "wta", "wimbledon", "us open"],
-    "MMA/UFC": ["ufc", "mma", "bellator", "fighter"],
+    "Basketball": ["nba", "basketball", "lakers", "celtics", "bulls", "warriors", "bucks", "nets"],
+    "Football":   ["nfl", "football", "chiefs", "patriots", "cowboys", "eagles", "49ers"],
+    "Hockey":     ["nhl", "hockey", "leafs", "bruins", "rangers", "puck", "oilers"],
+    "Baseball":   ["mlb", "baseball", "yankees", "dodgers", "mets", "astros"],
+    "Soccer":     ["mls", "soccer", "premier", "la liga", "champions league", "bundesliga", "serie a"],
+    "Esports":    ["esports", "cs2", "lol", "valorant", "dota", "overwatch", "csgo"],
+    "Olympics":   ["olympics", "olympic", "curling", "biathlon", "skating", "alpine"],
+    "Tennis":     ["tennis", "atp", "wta", "wimbledon", "us open", "french open"],
+    "MMA/UFC":    ["ufc", "mma", "bellator", "fighter", "knockout", "submission"],
 }
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def detect_sport(text: str) -> str:
     text_lower = text.lower()
@@ -45,82 +111,150 @@ def detect_sport(text: str) -> str:
     return "Other"
 
 
-def parse_credibility(text: str) -> str:
-    """Determine credibility based on presence of a verifiable record."""
-    if RECORD_PATTERN.search(text):
+def extract_record(text: str) -> tuple[int, int] | None:
+    """Return (wins, losses) if a record is found in text, else None."""
+    m = RECORD_PATTERN.search(text)
+    if not m:
+        return None
+    groups = [g for g in m.groups() if g is not None]
+    if len(groups) < 2:
+        return None
+    try:
+        return int(groups[0]), int(groups[1])
+    except ValueError:
+        return None
+
+
+def parse_credibility(text: str, has_record: bool) -> str:
+    if has_record:
         return "verified"
-    hype_words = ["lock", "guaranteed", "can't miss", "whale", "free money", "99%"]
-    if any(w in text.lower() for w in hype_words):
+    if any(w in text.lower() for w in HYPE_WORDS):
         return "suspicious"
     return "unverified"
 
 
+def _get_with_retry(url: str, params: dict = None, max_retries: int = 3) -> httpx.Response:
+    """GET with exponential backoff on 429 rate-limit responses."""
+    delay = 2
+    for attempt in range(max_retries):
+        resp = httpx.get(url, params=params, headers=HEADERS, timeout=12.0)
+        if resp.status_code == 429:
+            print(f"  ⏳ Rate limited — waiting {delay}s before retry...")
+            time.sleep(delay)
+            delay *= 2
+            continue
+        return resp
+    return resp  # Return last response even if still 429
+
+
+def fetch_op_comments(permalink: str, author: str) -> str:
+    """
+    Fetch the comment thread for a post and return the concatenated text
+    of all TOP-LEVEL comments made by the OP. Falls back to "" on error.
+    Reddit comment JSON: GET /r/sub/comments/{id}.json
+    """
+    url = f"https://www.reddit.com{permalink}.json"
+    try:
+        time.sleep(0.8)  # Polite delay before each comment fetch
+        resp = _get_with_retry(url, params={"limit": 50, "depth": 1})
+        resp.raise_for_status()
+        data = resp.json()
+        # data[1] is the comments listing
+        comments = data[1]["data"]["children"]
+        op_texts = []
+        for c in comments:
+            cd = c.get("data", {})
+            if cd.get("author", "").lower() == author.lower():
+                body = cd.get("body", "")
+                if body and body != "[deleted]":
+                    op_texts.append(body)
+        return "\n".join(op_texts)
+    except Exception:
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Core parser
+# ---------------------------------------------------------------------------
+
 def parse_post(post_data: dict) -> dict | None:
     """Parse a Reddit post into a structured pick dict. Returns None if not a valid pick."""
-    title = post_data.get("title", "")
-    body = post_data.get("selftext", "")
-    author = post_data.get("author", "")
-    url = f"https://reddit.com{post_data.get('permalink', '')}"
+    title   = post_data.get("title", "")
+    body    = post_data.get("selftext", "")
+    author  = post_data.get("author", "")
+    permalink = post_data.get("permalink", "")
+    url     = f"https://reddit.com{permalink}"
     full_text = f"{title}\n{body}"
 
-    # Must have at least odds to be considered a pick
+    # Must have odds to be considered a pick
     odds_match = ODDS_PATTERN.search(full_text)
     if not odds_match:
         return None
-
     try:
         odds = int(odds_match.group(1))
     except ValueError:
         return None
 
-    # Parse record
-    record_match = RECORD_PATTERN.search(full_text)
-    wins = int(record_match.group(1)) if record_match else 0
-    losses = int(record_match.group(2)) if record_match else 0
+    # Try to find record in title + body first
+    record = extract_record(full_text)
 
-    # Parse units
-    units_match = UNITS_PATTERN.search(full_text)
-    risk_units = float(units_match.group(1)) if units_match else 1.0
-    risk_units = abs(risk_units)  # Ensure positive
+    # If not found, fetch OP's own comments and check there
+    op_comment_text = ""
+    if record is None and permalink:
+        op_comment_text = fetch_op_comments(permalink, author)
+        if op_comment_text:
+            record = extract_record(op_comment_text)
 
-    # Parse total units won (look for explicit +/-Xu in body)
-    units_history_match = re.search(r"([+-]\d+\.?\d*)\s*u(?:nits?)?", body, re.IGNORECASE)
-    total_units = float(units_history_match.group(1)) if units_history_match else 0.0
+    wins, losses = record if record else (0, 0)
 
-    sport = detect_sport(full_text)
-    credibility = parse_credibility(full_text)
+    # Build complete context for sport / credibility detection
+    all_text = f"{full_text}\n{op_comment_text}"
 
-    # Try to extract a clean pick text from the title
-    pick_text = title[:200] if title else "Unknown Pick"
+    # Parse units risk
+    units_match = UNITS_PATTERN.search(all_text)
+    risk_units = abs(float(units_match.group(1))) if units_match else 1.0
+    risk_units = min(risk_units, 10.0)
+
+    # Parse cumulative units won/lost from post (e.g. "+25.5u on the season")
+    units_history = re.search(r"([+-]\d+\.?\d*)\s*u(?:nits?)?", body, re.IGNORECASE)
+    total_units = float(units_history.group(1)) if units_history else 0.0
+
+    sport       = detect_sport(all_text)
+    credibility = parse_credibility(all_text, has_record=(record is not None))
+    pick_text   = title[:200] if title else "Unknown Pick"
 
     return {
-        "author": author,
-        "pick_text": pick_text,
-        "odds": odds,
-        "risk_units": min(risk_units, 10.0),  # Cap at 10u
-        "sport": sport,
-        "matchup": "",
-        "wins": wins,
-        "losses": losses,
-        "total_units": total_units,
-        "credibility": credibility,
-        "source_url": url,
-        "raw_post_text": full_text[:2000],
+        "author":        author,
+        "pick_text":     pick_text,
+        "odds":          odds,
+        "risk_units":    risk_units,
+        "sport":         sport,
+        "matchup":       "",
+        "wins":          wins,
+        "losses":        losses,
+        "total_units":   total_units,
+        "credibility":   credibility,
+        "source_url":    url,
+        "raw_post_text": all_text[:2000],
     }
 
 
-def fetch_reddit_posts(subreddit: str, query: str, limit: int = 10) -> list[dict]:
+# ---------------------------------------------------------------------------
+# Reddit fetch
+# ---------------------------------------------------------------------------
+
+def fetch_reddit_posts(subreddit: str, query: str, limit: int = 25) -> list[dict]:
     """Fetch posts from a subreddit using Reddit's public JSON API."""
     url = f"https://www.reddit.com/r/{subreddit}/search.json"
     params = {
-        "q": query,
-        "sort": "new",
-        "limit": limit,
+        "q":           query,
+        "sort":        "new",
+        "limit":       limit,
         "restrict_sr": "true",
-        "t": "day",
+        "t":           "week",
     }
     try:
-        resp = httpx.get(url, params=params, headers=HEADERS, timeout=10.0)
+        resp = _get_with_retry(url, params=params)
         resp.raise_for_status()
         children = resp.json()["data"]["children"]
         return [c["data"] for c in children]
@@ -129,18 +263,21 @@ def fetch_reddit_posts(subreddit: str, query: str, limit: int = 10) -> list[dict
         return []
 
 
+# ---------------------------------------------------------------------------
+# DB helpers
+# ---------------------------------------------------------------------------
+
 def upsert_capper(sb, author: str, parsed: dict) -> str | None:
-    """Upsert a capper record, return their UUID."""
     capper_data = {
-        "username": author,
-        "platform": "Reddit",
-        "display_name": author,
-        "profile_url": f"https://reddit.com/u/{author}",
-        "total_wins": parsed["wins"],
-        "total_losses": parsed["losses"],
+        "username":        author,
+        "platform":        "Reddit",
+        "display_name":    author,
+        "profile_url":     f"https://reddit.com/u/{author}",
+        "total_wins":      parsed["wins"],
+        "total_losses":    parsed["losses"],
         "total_units_won": parsed["total_units"],
-        "credibility": parsed["credibility"],
-        "last_active": datetime.now(timezone.utc).isoformat(),
+        "credibility":     parsed["credibility"],
+        "last_active":     datetime.now(timezone.utc).isoformat(),
     }
     try:
         resp = sb.table("cappers").upsert(capper_data, on_conflict="username").execute()
@@ -151,16 +288,15 @@ def upsert_capper(sb, author: str, parsed: dict) -> str | None:
 
 
 def insert_pick(sb, capper_id: str, parsed: dict):
-    """Insert a pick into the immutable picks ledger."""
     pick_data = {
-        "capper_id": capper_id,
-        "sport": parsed["sport"],
-        "matchup": parsed["matchup"],
-        "pick_text": parsed["pick_text"],
-        "odds": parsed["odds"],
-        "risk_units": parsed["risk_units"],
-        "status": "pending",
-        "source_url": parsed["source_url"],
+        "capper_id":    capper_id,
+        "sport":        parsed["sport"],
+        "matchup":      parsed["matchup"],
+        "pick_text":    parsed["pick_text"],
+        "odds":         parsed["odds"],
+        "risk_units":   parsed["risk_units"],
+        "status":       "pending",
+        "source_url":   parsed["source_url"],
         "raw_post_text": parsed["raw_post_text"],
     }
     try:
@@ -169,33 +305,41 @@ def insert_pick(sb, capper_id: str, parsed: dict):
         print(f"  ⚠️  Could not insert pick: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Main runner
+# ---------------------------------------------------------------------------
+
 def run_scraper():
     sb = get_supabase()
     print("🔍 PickScout Scraper starting...\n")
 
-    scraped_authors = set()
+    seen_urls  = set()   # Deduplicate by permalink
     picks_added = 0
 
     for subreddit in SUBREDDITS:
         for query in SEARCH_QUERIES:
             posts = fetch_reddit_posts(subreddit, query)
             for post in posts:
-                author = post.get("author", "")
-                if not author or author in scraped_authors or author == "[deleted]":
+                author    = post.get("author", "")
+                permalink = post.get("permalink", "")
+                url       = f"https://reddit.com{permalink}"
+
+                if not author or author == "[deleted]" or url in seen_urls:
                     continue
 
                 parsed = parse_post(post)
                 if not parsed:
                     continue
 
-                scraped_authors.add(author)
+                seen_urls.add(url)
                 capper_id = upsert_capper(sb, author, parsed)
                 if capper_id:
                     insert_pick(sb, capper_id, parsed)
                     picks_added += 1
-                    cred = parsed["credibility"]
+                    cred  = parsed["credibility"]
+                    record_str = f" ({parsed['wins']}-{parsed['losses']})" if parsed["wins"] or parsed["losses"] else ""
                     emoji = "🟢" if cred == "verified" else "🟡" if cred == "unverified" else "🔴"
-                    print(f"  {emoji} [{cred}] {author}: {parsed['pick_text'][:60]}")
+                    print(f"  {emoji} [{cred}]{record_str} {author}: {parsed['pick_text'][:55]}")
 
     print(f"\n✅ Scraper done. {picks_added} picks added.")
 
