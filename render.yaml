@@ -1,0 +1,37 @@
+# Render Blueprint — deploys both backend (FastAPI) and frontend (Next.js) as Docker services
+# Push this file to GitHub root and connect the repo in Render → "New → Blueprint"
+
+services:
+  # ─── Backend: FastAPI Scraper + API ─────────────────────────────────
+  - type: web
+    name: pickscout-backend
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        sync: false          # ← You'll paste this in Render dashboard
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+
+  # ─── Frontend: Next.js Dashboard ────────────────────────────────────
+  - type: web
+    name: pickscout-frontend
+    runtime: docker
+    dockerfilePath: ./frontend/Dockerfile
+    dockerContext: ./frontend
+    plan: free
+    envVars:
+      - key: NEXT_PUBLIC_SUPABASE_URL
+        sync: false
+      - key: NEXT_PUBLIC_SUPABASE_ANON_KEY
+        sync: false
+      - key: NEXT_PUBLIC_API_URL
+        fromService:
+          name: pickscout-backend
+          type: web
+          property: host              # Automatically wires backend URL → frontend

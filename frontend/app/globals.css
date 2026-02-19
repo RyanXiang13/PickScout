@@ -1,0 +1,187 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-primary: #080b14;
+  --bg-card: #0f1523;
+  --bg-card-hover: #141c2e;
+  --border: rgba(255,255,255,0.07);
+  --accent-green: #00d68f;
+  --accent-yellow: #f5a623;
+  --accent-red: #ff4757;
+  --accent-blue: #4f8ef7;
+  --text-primary: #f0f4ff;
+  --text-secondary: #8892a4;
+  --gradient-hero: linear-gradient(135deg, #0f1523 0%, #1a2540 50%, #0f1523 100%);
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--bg-primary); }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
+
+/* Animations */
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(16px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes pulse-green {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(0, 214, 143, 0.4); }
+  50% { box-shadow: 0 0 0 8px rgba(0, 214, 143, 0); }
+}
+
+.animate-fade-in-up {
+  animation: fadeInUp 0.4s ease forwards;
+}
+
+.animate-fade-in-up-delay-1 { animation-delay: 0.1s; opacity: 0; animation-fill-mode: forwards; animation-duration: 0.4s; animation-name: fadeInUp; }
+.animate-fade-in-up-delay-2 { animation-delay: 0.2s; opacity: 0; animation-fill-mode: forwards; animation-duration: 0.4s; animation-name: fadeInUp; }
+.animate-fade-in-up-delay-3 { animation-delay: 0.3s; opacity: 0; animation-fill-mode: forwards; animation-duration: 0.4s; animation-name: fadeInUp; }
+
+/* Glow effects */
+.glow-green { box-shadow: 0 0 20px rgba(0, 214, 143, 0.15); }
+.glow-yellow { box-shadow: 0 0 20px rgba(245, 166, 35, 0.15); }
+.glow-red { box-shadow: 0 0 20px rgba(255, 71, 87, 0.15); }
+
+/* Skeleton loading */
+.skeleton {
+  background: linear-gradient(90deg, rgba(255,255,255,0.04) 25%, rgba(255,255,255,0.08) 50%, rgba(255,255,255,0.04) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+  border-radius: 6px;
+}
+
+/* Custom button styles */
+.btn-primary {
+  background: linear-gradient(135deg, var(--accent-green), #00b87a);
+  color: #000;
+  font-weight: 700;
+  border: none;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.btn-primary:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 25px rgba(0, 214, 143, 0.35);
+}
+
+.btn-primary:active {
+  transform: translateY(0);
+}
+
+/* Card base */
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  transition: all 0.25s ease;
+}
+
+.card:hover {
+  background: var(--bg-card-hover);
+  border-color: rgba(255,255,255,0.12);
+  transform: translateY(-2px);
+}
+
+/* Badge */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  border-radius: 100px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+
+.badge-verified {
+  background: rgba(0, 214, 143, 0.12);
+  color: var(--accent-green);
+  border: 1px solid rgba(0, 214, 143, 0.25);
+}
+
+.badge-unverified {
+  background: rgba(245, 166, 35, 0.12);
+  color: var(--accent-yellow);
+  border: 1px solid rgba(245, 166, 35, 0.25);
+}
+
+.badge-suspicious {
+  background: rgba(255, 71, 87, 0.12);
+  color: var(--accent-red);
+  border: 1px solid rgba(255, 71, 87, 0.25);
+}
+
+/* Input */
+.input-dark {
+  background: rgba(255,255,255,0.05);
+  border: 1px solid rgba(255,255,255,0.1);
+  color: var(--text-primary);
+  border-radius: 10px;
+  transition: border-color 0.2s, background 0.2s;
+}
+
+.input-dark:focus {
+  outline: none;
+  border-color: var(--accent-green);
+  background: rgba(0, 214, 143, 0.05);
+}
+
+.input-dark::placeholder {
+  color: var(--text-secondary);
+}
+
+/* Filter chip */
+.filter-chip {
+  background: rgba(255,255,255,0.05);
+  border: 1px solid rgba(255,255,255,0.08);
+  color: var(--text-secondary);
+  border-radius: 100px;
+  padding: 6px 16px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  white-space: nowrap;
+}
+
+.filter-chip:hover {
+  background: rgba(255,255,255,0.08);
+  color: var(--text-primary);
+}
+
+.filter-chip.active {
+  background: rgba(0, 214, 143, 0.12);
+  border-color: rgba(0, 214, 143, 0.4);
+  color: var(--accent-green);
+}
+
+/* Profit number */
+.profit-positive { color: var(--accent-green); }
+.profit-negative { color: var(--accent-red); }
